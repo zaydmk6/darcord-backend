@@ -1,9 +1,9 @@
-import sqlite3, jwt, datetime, os, random, string
+import sqlite3, jwt, datetime, os, random, string, bcrypt
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-SECRET_KEY = "SUPER_SECRET_KEY_CHANGE_THIS"
+SECRET_KEY = "CHANGE_THIS_SECRET_NOW"
 
 app = FastAPI()
 
@@ -15,23 +15,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ===== FILES =====
 os.makedirs("avatars", exist_ok=True)
 app.mount("/avatars", StaticFiles(directory="avatars"), name="avatars")
 
+# ===== DATABASE =====
 db = sqlite3.connect("database.db", check_same_thread=False)
 cursor = db.cursor()
 
-# ===== TABLES =====
-cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, avatar TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password BLOB, avatar TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS status (username TEXT, state TEXT)")
-cursor.execute("CREATE TABLE IF NOT EXISTS xp (username TEXT, points INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS friends (user1 TEXT, user2 TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY, name TEXT, owner TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, server_id INTEGER, name TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS members (server_id INTEGER, username TEXT, role TEXT)")
-cursor.execute("CREATE TABLE IF NOT EXISTS invites (code TEXT, server_id INTEGER)")
-cursor.execute("CREATE TABLE IF NOT EXISTS muted (server_id INTEGER, username TEXT)")
 cursor.execute("CREATE TABLE IF NOT EXISTS messages (channel_id INTEGER, username TEXT, content TEXT, timestamp TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS voice_rooms (id INTEGER PRIMARY KEY, server_id INTEGER, name TEXT)")
 db.commit()
 
 # ===== JWT =====
@@ -47,12 +45,20 @@ def verify_token(token):
     except:
         return None
 
+# ===== PASSWORD =====
+def hash_password(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+def verify_password(password, hashed):
+    return bcrypt.checkpw(password.encode(), hashed)
+
 # ===== AUTH =====
 @app.post("/register")
 def register(data: dict):
     try:
+        hashed = hash_password(data["password"])
         cursor.execute("INSERT INTO users VALUES (NULL,?,?,?)",
-                       (data["username"], data["password"], ""))
+                       (data["username"], hashed, ""))
         db.commit()
         return {"status": "ok"}
     except:
@@ -60,120 +66,56 @@ def register(data: dict):
 
 @app.post("/login")
 def login(data: dict):
-    cursor.execute("SELECT * FROM users WHERE username=? AND password=?",
-                   (data["username"], data["password"]))
-    if cursor.fetchone():
+    cursor.execute("SELECT password FROM users WHERE username=?",
+                   (data["username"],))
+    row = cursor.fetchone()
+
+    if row and verify_password(data["password"], row[0]):
         token = create_token(data["username"])
-        cursor.execute("DELETE FROM status WHERE username=?",(data["username"],))
-        cursor.execute("INSERT INTO status VALUES (?,?)",(data["username"],"online"))
-        db.commit()
         return {"token": token}
+
     return {"error": "invalid"}
 
-# ===== AVATAR =====
-@app.post("/upload_avatar")
-async def upload_avatar(token:str, file:UploadFile=File(...)):
-    username = verify_token(token)
-    if not username: return {"error":"Unauthorized"}
-
-    path = f"avatars/{username}.png"
-    with open(path,"wb") as f:
-        f.write(await file.read())
-
-    cursor.execute("UPDATE users SET avatar=? WHERE username=?",(path,username))
-    db.commit()
-    return {"status":"uploaded"}
-
-# ===== FRIENDS =====
-@app.post("/add_friend")
-def add_friend(data:dict):
+# ===== CREATE VOICE ROOM =====
+@app.post("/create_voice_room")
+def create_voice_room(data:dict):
     user = verify_token(data["token"])
-    cursor.execute("INSERT INTO friends VALUES (?,?)",(user,data["target"]))
-    db.commit()
-    return {"status":"added"}
+    if not user:
+        return {"error":"unauthorized"}
 
-@app.get("/friends/{username}")
-def get_friends(username:str):
-    cursor.execute("SELECT user2 FROM friends WHERE user1=?",(username,))
-    return cursor.fetchall()
-
-# ===== SERVERS =====
-@app.post("/create_server")
-def create_server(data:dict):
-    user = verify_token(data["token"])
-    cursor.execute("INSERT INTO servers VALUES (NULL,?,?)",(data["name"],user))
-    db.commit()
-    sid = cursor.lastrowid
-    cursor.execute("INSERT INTO members VALUES (?,?,?)",(sid,user,"Owner"))
-    cursor.execute("INSERT INTO channels VALUES (NULL,?,?)",(sid,"general"))
-    db.commit()
-    return {"server_id":sid}
-
-@app.post("/create_channel")
-def create_channel(data:dict):
-    user = verify_token(data["token"])
-    cursor.execute("INSERT INTO channels VALUES (NULL,?,?)",(data["server_id"],data["name"]))
+    cursor.execute("INSERT INTO voice_rooms VALUES (NULL,?,?)",
+                   (data["server_id"], data["name"]))
     db.commit()
     return {"status":"created"}
 
-# ===== INVITE =====
-@app.post("/create_invite")
-def create_invite(data:dict):
-    code=''.join(random.choices(string.ascii_letters+string.digits,k=8))
-    cursor.execute("INSERT INTO invites VALUES (?,?)",(code,data["server_id"]))
-    db.commit()
-    return {"code":code}
+# ===== WEBSOCKET VOICE ROOM =====
+voice_rooms_ws = {}
 
-@app.post("/join_invite")
-def join_invite(data:dict):
-    user = verify_token(data["token"])
-    cursor.execute("SELECT server_id FROM invites WHERE code=?",(data["code"],))
-    result = cursor.fetchone()
-    if result:
-        cursor.execute("INSERT INTO members VALUES (?,?,?)",(result[0],user,"Member"))
-        db.commit()
-        return {"joined":result[0]}
-    return {"error":"invalid"}
-
-# ===== LOAD MESSAGES =====
-@app.get("/messages/{channel_id}")
-def get_messages(channel_id:int):
-    cursor.execute("SELECT username,content FROM messages WHERE channel_id=?",(channel_id,))
-    return cursor.fetchall()
-
-# ===== WEBSOCKET CHAT + XP =====
-clients={}
-
-@app.websocket("/ws/{channel_id}")
-async def ws(ws:WebSocket, channel_id:int):
+@app.websocket("/ws/voice/{room_id}")
+async def voice_ws(ws: WebSocket, room_id:int):
     await ws.accept()
-    clients.setdefault(channel_id,[]).append(ws)
+    username = None
+
+    voice_rooms_ws.setdefault(room_id, [])
 
     try:
         while True:
-            data=await ws.receive_json()
-            username=verify_token(data["token"])
+            data = await ws.receive_json()
+            username = verify_token(data.get("token"))
 
-            timestamp=datetime.datetime.utcnow().isoformat()
-            cursor.execute("INSERT INTO messages VALUES (?,?,?,?)",
-                           (channel_id,username,data["message"],timestamp))
+            if username and ws not in voice_rooms_ws[room_id]:
+                voice_rooms_ws[room_id].append(ws)
 
-            # XP
-            cursor.execute("SELECT points FROM xp WHERE username=?",(username,))
-            row=cursor.fetchone()
-            if row:
-                cursor.execute("UPDATE xp SET points=points+5 WHERE username=?",(username,))
-            else:
-                cursor.execute("INSERT INTO xp VALUES (?,?)",(username,5))
-            db.commit()
-
-            for c in clients[channel_id]:
-                await c.send_json({
-                    "username":username,
-                    "message":data["message"]
-                })
+            for client in voice_rooms_ws[room_id]:
+                if client != ws:
+                    await client.send_json({
+                        "type": data["type"],
+                        "from": username,
+                        "offer": data.get("offer"),
+                        "answer": data.get("answer"),
+                        "candidate": data.get("candidate")
+                    })
 
     except WebSocketDisconnect:
-        clients[channel_id].remove(ws)
-        cursor.execute("UPDATE status SET state='offline' WHERE username=?",(username,))
-        db.commit()
+        if ws in voice_rooms_ws[room_id]:
+            voice_rooms_ws[room_id].remove(ws)
