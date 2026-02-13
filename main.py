@@ -2,7 +2,7 @@ import sqlite3, jwt, datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-SECRET_KEY = "DARCORD_SUPER_SECRET_KEY_32_CHAR_LONG"
+SECRET_KEY = "DARCORD_SUPER_SECRET_KEY_32_CHAR_LONG_STRONG"
 
 app = FastAPI()
 
@@ -14,51 +14,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== DATABASE =====
 db = sqlite3.connect("database.db", check_same_thread=False)
 cursor = db.cursor()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS servers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    owner TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    server_id INTEGER,
-    name TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS members (
-    server_id INTEGER,
-    username TEXT,
-    role TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    channel_id INTEGER,
-    username TEXT,
-    content TEXT,
-    timestamp TEXT
-)
-""")
-
+# ===== TABLES =====
+cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY, name TEXT, owner TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, server_id INTEGER, name TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS members (server_id INTEGER, username TEXT, role TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS muted (server_id INTEGER, username TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS messages (channel_id INTEGER, username TEXT, content TEXT, timestamp TEXT)")
 db.commit()
 
 # ===== JWT =====
@@ -82,7 +47,7 @@ def register(data: dict):
         db.commit()
         return {"status":"ok"}
     except:
-        return {"error":"Username exists"}
+        return {"error":"exists"}
 
 @app.post("/login")
 def login(data: dict):
@@ -90,7 +55,7 @@ def login(data: dict):
                    (data["username"], data["password"]))
     if cursor.fetchone():
         return {"token": create_token(data["username"])}
-    return {"error":"Invalid login"}
+    return {"error":"invalid"}
 
 # ===== CREATE SERVER =====
 @app.post("/create_server")
@@ -100,15 +65,16 @@ def create_server(data: dict):
 
     cursor.execute("INSERT INTO servers VALUES (NULL, ?, ?)", (data["name"], user))
     db.commit()
-    server_id = cursor.lastrowid
+    sid = cursor.lastrowid
 
-    cursor.execute("INSERT INTO members VALUES (?, ?, ?)", (server_id, user, "Owner"))
-    cursor.execute("INSERT INTO channels VALUES (NULL, ?, ?)", (server_id, "general"))
+    cursor.execute("INSERT INTO members VALUES (?, ?, ?)", (sid, user, "Owner"))
+    cursor.execute("INSERT INTO channels VALUES (NULL, ?, ?)", (sid, "general"))
     db.commit()
 
-    return {"server_id": server_id}
+    return {"server_id": sid}
 
-# ===== WEBSOCKET CHAT =====
+# ===== WEBSOCKET =====
+online_users = {}
 clients = {}
 
 @app.websocket("/ws/{channel_id}")
@@ -124,17 +90,37 @@ async def websocket(ws: WebSocket, channel_id: int):
                 await ws.send_json({"error":"Unauthorized"})
                 continue
 
+            server_id = data["server_id"]
+
+            # سجل أونلاين
+            online_users[username] = server_id
+
+            # تحقق ميوت
+            cursor.execute("SELECT * FROM muted WHERE server_id=? AND username=?", (server_id, username))
+            if cursor.fetchone():
+                await ws.send_json({"error":"You are muted"})
+                continue
+
             timestamp = datetime.datetime.utcnow().isoformat()
 
             cursor.execute("INSERT INTO messages VALUES (?, ?, ?, ?)",
                            (channel_id, username, data["message"], timestamp))
             db.commit()
 
+            # بث الرسالة
             for client in clients[channel_id]:
                 await client.send_json({
+                    "type":"chat",
                     "username": username,
-                    "message": data["message"],
-                    "timestamp": timestamp
+                    "message": data["message"]
+                })
+
+            # بث قائمة الأونلاين
+            members_online = [u for u,s in online_users.items() if s == server_id]
+            for client in clients[channel_id]:
+                await client.send_json({
+                    "type":"online",
+                    "users": members_online
                 })
 
     except WebSocketDisconnect:
